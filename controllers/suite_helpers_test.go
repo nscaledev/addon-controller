@@ -19,6 +19,7 @@ package controllers_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -41,6 +42,7 @@ import (
 	"github.com/projectsveltos/addon-controller/controllers"
 	"github.com/projectsveltos/addon-controller/lib/clusterops"
 	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/sveltos_upgrade"
 )
 
 const (
@@ -468,4 +470,44 @@ func prepareForDeployment(clusterProfile *configv1beta1.ClusterProfile, //nolint
 
 	Expect(testEnv.Create(context.TODO(), secret)).To(Succeed())
 	Expect(waitForObject(context.TODO(), testEnv.Client, secret)).To(Succeed())
+}
+
+// createNamespace creates a namespace with a random name and returns the name.
+func createNamespace() string {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: randomString()}}
+	Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+	return ns.Name
+}
+
+// createResourceSummaryWithFinalizer creates a ResourceSummary of the cluster carrying the finalizer
+// drift-detection-manager puts on it.
+func createResourceSummaryWithFinalizer(clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType) *libsveltosv1beta1.ResourceSummary {
+
+	rs := &libsveltosv1beta1.ResourceSummary{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: clusterNamespace,
+			Name:      randomString(),
+			Labels: map[string]string{
+				sveltos_upgrade.ClusterNameLabel: clusterName,
+				sveltos_upgrade.ClusterTypeLabel: strings.ToLower(string(clusterType)),
+			},
+			Annotations: map[string]string{
+				libsveltosv1beta1.ClusterSummaryNamespaceAnnotation: clusterNamespace,
+			},
+			Finalizers: []string{libsveltosv1beta1.ResourceSummaryFinalizer},
+		},
+	}
+	Expect(testEnv.Create(context.TODO(), rs)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, rs)).To(Succeed())
+	return rs
+}
+
+// removeResourceSummaryFinalizer removes the finalizers of the ResourceSummary so it can go away.
+func removeResourceSummaryFinalizer(rs *libsveltosv1beta1.ResourceSummary) {
+	current := &libsveltosv1beta1.ResourceSummary{}
+	Expect(testEnv.GetAPIReader().Get(context.TODO(), client.ObjectKeyFromObject(rs), current)).To(Succeed())
+	current.Finalizers = nil
+	Expect(testEnv.Update(context.TODO(), current)).To(Succeed())
 }

@@ -370,7 +370,7 @@ func isGroupMemberStale(ctx context.Context, c client.Client, clusterNamespace s
 func removeStaleGroupMember(ctx context.Context, c client.Client, restConfig *rest.Config, clusterNamespace string,
 	member agentgroup.Member, logger logr.Logger) {
 
-	err := removeStaleResourceSummary(ctx, clusterNamespace, member.Name, member.ClusterType, logger)
+	err := removeStaleResourceSummary(ctx, clusterNamespace, member.Name, member.ClusterType, false, logger)
 	if err != nil {
 		return
 	}

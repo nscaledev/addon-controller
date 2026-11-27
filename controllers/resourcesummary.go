@@ -14,8 +14,10 @@ limitations under the License.
 package controllers
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -415,7 +417,7 @@ func deployDriftDetectionManagerInManagementCluster(ctx context.Context, restCon
 	// for this cluster.
 	lbls := getDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType)
 
-	name, err := getDriftDetectionManagerDeploymentName(ctx, restConfig, lbls)
+	name, err := getDriftDetectionManagerDeploymentName(ctx, restConfig, lbls, logger)
 	if err != nil {
 		logger.V(logs.LogInfo).Info(
 			fmt.Sprintf("failed to get name for drift-detection-manager deployment: %v", err))
@@ -585,76 +587,110 @@ func unDeployResourceSummaryInstance(ctx context.Context, clusterNamespace, clus
 	return clusterClient.Delete(ctx, currentResourceSummary)
 }
 
-// Generate unique name for drift-detection-manager
+// listDriftDetectionManagerDeployments returns the drift-detection-manager Deployments in the management
+// cluster matching lbls.
+func listDriftDetectionManagerDeployments(ctx context.Context, restConfig *rest.Config,
+	lbls map[string]string) ([]appsv1.Deployment, error) {
 
-// getDriftDetectionManagerDeploymentName returns the name for a given drift-detection-manager deployment
-// started in the management cluster for a given cluster.
-func getDriftDetectionManagerDeploymentName(ctx context.Context, restConfig *rest.Config,
-	lbls map[string]string,
-) (name string, err error) {
-
-	labelSelector := metav1.LabelSelector{
-		MatchLabels: lbls,
-	}
-
-	// Create a new ListOptions object.
-	listOptions := metav1.ListOptions{
-		LabelSelector: labels.Set(labelSelector.MatchLabels).String(),
-	}
-
-	// Create a new ClientSet using the RESTConfig.
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// using client and a List would require permission at cluster level. So using clientset instead
 	deployments, err := clientset.AppsV1().Deployments(getDriftDetectionNamespaceInMgmtCluster(getSveltosNamespace())).
-		List(ctx, listOptions)
+		List(ctx, metav1.ListOptions{LabelSelector: labels.Set(lbls).String()})
+	if err != nil {
+		return nil, err
+	}
+
+	return deployments.Items, nil
+}
+
+// isDriftDetectionManagerGone returns true when the cluster has no drift-detection-manager Deployment
+// in the management cluster, so nothing is left to remove the finalizer of its ResourceSummaries.
+// Only agentless mode without grouping is considered: in push mode the ResourceSummaries in the
+// management cluster belong to the management cluster's own drift-detection-manager, and a group
+// drift-detection-manager is not found by the cluster's labels.
+func isDriftDetectionManagerGone(ctx context.Context, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType) (bool, error) {
+
+	if !getAgentInMgmtCluster() || isDriftDetectionGroupingEnabled() {
+		return false, nil
+	}
+
+	// A Deployment being deleted counts: its pod can still be releasing finalizers.
+	deployments, err := listDriftDetectionManagerDeployments(ctx, getManagementClusterConfig(),
+		getDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType))
+	if err != nil {
+		return false, err
+	}
+
+	return len(deployments) == 0, nil
+}
+
+// getDriftDetectionManagerDeploymentName returns the name of the drift-detection-manager Deployment
+// started in the management cluster for the cluster matching lbls, or a new random name if there is none.
+func getDriftDetectionManagerDeploymentName(ctx context.Context, restConfig *rest.Config,
+	lbls map[string]string, logger logr.Logger) (string, error) {
+
+	deployments, err := listDriftDetectionManagerDeployments(ctx, restConfig, lbls)
 	if err != nil {
 		return "", err
 	}
 
-	if len(deployments.Items) > 1 {
-		// while rare this can happen. Multiple ClusterProfiles matching same cluster may concurrently query for
-		// the same drift-detection-manager deployment, leading to redundant creation attempts if the deployment
-		// doesn't exist.
-		for i := range deployments.Items {
-			// Ignore eventual error, since we are returning an error anyway
-			_ = clientset.AppsV1().Deployments(getDriftDetectionNamespaceInMgmtCluster(getSveltosNamespace())).
-				Delete(ctx,
-					deployments.Items[i].Name, metav1.DeleteOptions{})
+	// A Deployment being deleted is going away: keeping it would leave the cluster with none.
+	deployments = slices.DeleteFunc(deployments, func(d appsv1.Deployment) bool {
+		return d.DeletionTimestamp != nil
+	})
+
+	if len(deployments) == 0 {
+		const nameLength = 20
+		return "drift-detection-" + randutils.RandomString(nameLength), nil
+	}
+
+	// Every ClusterSummary of the cluster deploys the drift-detection-manager from its own worker, so
+	// concurrent deploys can each create one. Keep exactly one, as the ResourceSummaries it already
+	// put a finalizer on need it to release them. Oldest first, then by name, so that every caller
+	// keeps the same one.
+	slices.SortFunc(deployments, func(a, b appsv1.Deployment) int {
+		return cmp.Or(a.CreationTimestamp.Compare(b.CreationTimestamp.Time), cmp.Compare(a.Name, b.Name))
+	})
+
+	kept := deployments[0].Name
+	if len(deployments) > 1 {
+		if err := removeDuplicateDriftDetectionManagers(ctx, restConfig, deployments[1:], kept, logger); err != nil {
+			return "", err
 		}
-		err = fmt.Errorf("more than one drift-detection deployment found")
-		return name, err
 	}
 
-	objects := make([]client.Object, len(deployments.Items))
-	for i := range deployments.Items {
-		objects[i] = &deployments.Items[i]
-	}
-
-	return getInstantiatedObjectName(objects)
+	return kept, nil
 }
 
-func getInstantiatedObjectName(objects []client.Object) (name string, err error) {
-	switch len(objects) {
-	case 0:
-		// no cluster exist yet. Return random name.
-		// If one clusterProfile with this name already exists,
-		// a conflict will happen. On retry different name will
-		// be picked
-		prefix := "drift-detection-"
-		const nameLength = 20
-		name = prefix + randutils.RandomString(nameLength)
-		err = nil
-	case 1:
-		name = objects[0].GetName()
-		err = nil
-	default:
-		err = fmt.Errorf("more than one drift-detection deployment found")
+// removeDuplicateDriftDetectionManagers deletes duplicates on a best-effort basis: failing would fail
+// a deploy that has a usable drift-detection-manager, and a leftover duplicate is removed by the next
+// call or, once the cluster is gone, by the stale drift-detection resource cleanup.
+func removeDuplicateDriftDetectionManagers(ctx context.Context, restConfig *rest.Config,
+	duplicates []appsv1.Deployment, kept string, logger logr.Logger) error {
+
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return err
 	}
-	return name, err
+
+	for i := range duplicates {
+		d := &duplicates[i]
+		err := clientset.AppsV1().Deployments(d.Namespace).Delete(ctx, d.Name, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to delete duplicate drift-detection-manager %s: %v",
+				d.Name, err))
+			continue
+		}
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("deleted duplicate drift-detection-manager %s, keeping %s",
+			d.Name, kept))
+	}
+
+	return nil
 }
 
 // getClusterDataFromDriftDetectionManagerDeployment extracts the cluster's namespace, name, and type
@@ -722,7 +758,7 @@ func removeDriftDetectionManagerFromManagementCluster(ctx context.Context,
 	// Addon-controller deploys drift-detection-manager resources for each cluster matching at least
 	// one ClusterProfile with SyncMode set to ContinuousWithDriftDetection.
 	lbls := getDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType)
-	name, err := getDriftDetectionManagerDeploymentName(ctx, getManagementClusterConfig(), lbls)
+	name, err := getDriftDetectionManagerDeploymentName(ctx, getManagementClusterConfig(), lbls, logger)
 	if err != nil {
 		logger.V(logs.LogInfo).Info(
 			fmt.Sprintf("failed to get name for drift-detection-manager deployment: %v", err))

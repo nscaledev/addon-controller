@@ -534,7 +534,7 @@ metadata:
 			currentRS := &libsveltosv1beta1.ResourceSummary{}
 
 			err = controllers.RemoveStaleResourceSummary(context.TODO(), clusterNamespace, clusterName,
-				clusterType, logger)
+				clusterType, false, logger)
 			Expect(err).ToNot(BeNil())
 			Expect(err.Error()).To(ContainSubstring("resourceSummary instances still present"))
 
@@ -613,7 +613,7 @@ metadata:
 			// chance to actually complete before the caller (e.g. drift-detection-manager
 			// removal) proceeds. That's expected here too; it is not what this test is about.
 			err = controllers.RemoveStaleResourceSummary(context.TODO(), targetNamespace, clusterName,
-				clusterType, logger)
+				clusterType, false, logger)
 			Expect(err).ToNot(BeNil())
 			Expect(err.Error()).To(ContainSubstring("resourceSummary instances still present"))
 
@@ -634,9 +634,63 @@ metadata:
 			// clusterName/clusterType and would previously have kept this call reporting "still
 			// present" forever, even though nothing belonging to targetNamespace remains.
 			err = controllers.RemoveStaleResourceSummary(context.TODO(), targetNamespace, clusterName,
-				clusterType, logger)
+				clusterType, false, logger)
 			Expect(err).To(BeNil())
 		})
+
+	It("removeStaleResourceSummary releases the drift-detection-manager finalizer when asked to", func() {
+		clusterNamespace, clusterName := createNamespace(), randomString()
+		clusterType := libsveltosv1beta1.ClusterTypeSveltos
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+		rs := createResourceSummaryWithFinalizer(clusterNamespace, clusterName, clusterType)
+
+		err := controllers.RemoveStaleResourceSummary(context.TODO(), clusterNamespace, clusterName,
+			clusterType, true, logger)
+		Expect(err).To(MatchError(ContainSubstring("resourceSummary instances still present")))
+
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(), client.ObjectKeyFromObject(rs), &libsveltosv1beta1.ResourceSummary{})
+			return apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("removeStaleResourceSummary keeps the drift-detection-manager finalizer otherwise", func() {
+		clusterNamespace, clusterName := createNamespace(), randomString()
+		clusterType := libsveltosv1beta1.ClusterTypeSveltos
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+		rs := createResourceSummaryWithFinalizer(clusterNamespace, clusterName, clusterType)
+
+		err := controllers.RemoveStaleResourceSummary(context.TODO(), clusterNamespace, clusterName,
+			clusterType, false, logger)
+		Expect(err).To(MatchError(ContainSubstring("resourceSummary instances still present")))
+
+		current := &libsveltosv1beta1.ResourceSummary{}
+		Expect(testEnv.GetAPIReader().Get(context.TODO(), client.ObjectKeyFromObject(rs), current)).To(Succeed())
+		Expect(current.DeletionTimestamp).ToNot(BeNil())
+		Expect(current.Finalizers).To(ConsistOf(libsveltosv1beta1.ResourceSummaryFinalizer))
+
+		removeResourceSummaryFinalizer(rs)
+	})
+
+	It("removeStaleResourceSummary releases a ResourceSummary already being deleted", func() {
+		clusterNamespace, clusterName := createNamespace(), randomString()
+		clusterType := libsveltosv1beta1.ClusterTypeSveltos
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+		rs := createResourceSummaryWithFinalizer(clusterNamespace, clusterName, clusterType)
+		Expect(testEnv.Delete(context.TODO(), rs)).To(Succeed())
+		Eventually(func() bool {
+			current := &libsveltosv1beta1.ResourceSummary{}
+			err := testEnv.Get(context.TODO(), client.ObjectKeyFromObject(rs), current)
+			return err == nil && current.DeletionTimestamp != nil
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		err := controllers.RemoveStaleResourceSummary(context.TODO(), clusterNamespace, clusterName,
+			clusterType, true, logger)
+		Expect(err).To(MatchError(ContainSubstring("resourceSummary instances still present")))
+
+		err = testEnv.GetAPIReader().Get(context.TODO(), client.ObjectKeyFromObject(rs), &libsveltosv1beta1.ResourceSummary{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
 
 	It("removeStaleDriftDetectionResources deletes drift-detection-manager after all ResourceSummaries are gone",
 		func(ctx SpecContext) {

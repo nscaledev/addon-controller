@@ -2028,7 +2028,16 @@ func (r *ClusterSummaryReconciler) handleDeletedCluster(ctx context.Context,
 	logger.V(logs.LogDebug).Info("remove drift-detection-manager resources from management cluster")
 	cs := clusterSummaryScope.ClusterSummary
 
-	err := removeStaleResourceSummary(ctx, cs.Spec.ClusterNamespace, cs.Spec.ClusterName, cs.Spec.ClusterType, logger)
+	// No drift-detection-manager comes back for a deleted cluster, so with none left nothing else
+	// releases the finalizer of its ResourceSummaries.
+	releaseFinalizer, err := isDriftDetectionManagerGone(ctx, cs.Spec.ClusterNamespace, cs.Spec.ClusterName,
+		cs.Spec.ClusterType)
+	if err != nil {
+		return err
+	}
+
+	err = removeStaleResourceSummary(ctx, cs.Spec.ClusterNamespace, cs.Spec.ClusterName, cs.Spec.ClusterType,
+		releaseFinalizer, logger)
 	if err != nil {
 		logger.V(logs.LogInfo).Info(
 			fmt.Sprintf("failed to remove resourceSummary instances from management cluster: %v", err))

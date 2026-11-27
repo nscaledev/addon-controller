@@ -302,9 +302,10 @@ var (
 )
 
 var (
-	DeplAssociatedClusterExist = deplAssociatedClusterExist
-	RemoveStaleResourceSummary = removeStaleResourceSummary
-	RemoveDuplicates           = removeDuplicates
+	DeplAssociatedClusterExist  = deplAssociatedClusterExist
+	RemoveStaleResourceSummary  = removeStaleResourceSummary
+	IsDriftDetectionManagerGone = isDriftDetectionManagerGone
+	RemoveDuplicates            = removeDuplicates
 )
 
 var (

@@ -28,6 +28,7 @@ import (
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -114,6 +115,11 @@ var _ = Describe("ClustersummaryController", func() {
 		// Get ClusterSummary so OwnerReference is set
 		Expect(testEnv.Get(context.TODO(),
 			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name}, clusterSummary)).To(Succeed())
+	})
+
+	AfterEach(func() {
+		controllers.SetAgentClustersPerInstance(0)
+		controllers.SetAgentInMgmtCluster(false)
 	})
 
 	It("isReady returns true if CAPI Cluster has Initialization.ControlPlaneInitialized set to true", func() {
@@ -1117,6 +1123,88 @@ var _ = Describe("ClustersummaryController", func() {
 		Expect(err).To(BeNil())
 		Expect(result.RequeueAfter).To(BeZero())
 	})
+
+	It("reconcileDelete releases the ResourceSummaries of a deleted cluster with no drift-detection-manager", func() {
+		controllers.SetAgentInMgmtCluster(true)
+		controllers.SetAgentClustersPerInstance(1)
+
+		controllerutil.AddFinalizer(clusterSummary, configv1beta1.ClusterSummaryFinalizer)
+		now := metav1.NewTime(time.Now())
+		clusterSummary.DeletionTimestamp = &now
+
+		rs := createResourceSummaryWithFinalizer(cluster.Namespace, cluster.Name, libsveltosv1beta1.ClusterTypeCapi)
+
+		// No cluster.
+		initObjects := []client.Object{
+			clusterProfile,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+		dep := fakedeployer.GetClient(context.TODO(), logger, c)
+		clusterSummaryReconciler := getClusterSummaryReconciler(c, dep)
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		Eventually(func() bool {
+			result, err := controllers.ReconcileDelete(clusterSummaryReconciler, context.TODO(), clusterSummaryScope, logger)
+			return err == nil && result.RequeueAfter == 0
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Expect(controllerutil.ContainsFinalizer(clusterSummaryScope.ClusterSummary,
+			configv1beta1.ClusterSummaryFinalizer)).To(BeFalse())
+		err := testEnv.GetAPIReader().Get(context.TODO(), client.ObjectKeyFromObject(rs), &libsveltosv1beta1.ResourceSummary{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("reconcileDelete waits for the drift-detection-manager to release the ResourceSummaries of a deleted cluster",
+		func() {
+			controllers.SetAgentInMgmtCluster(true)
+			controllers.SetAgentClustersPerInstance(1)
+
+			controllerutil.AddFinalizer(clusterSummary, configv1beta1.ClusterSummaryFinalizer)
+			now := metav1.NewTime(time.Now())
+			clusterSummary.DeletionTimestamp = &now
+
+			rs := createResourceSummaryWithFinalizer(cluster.Namespace, cluster.Name, libsveltosv1beta1.ClusterTypeCapi)
+			ddm := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: controllers.GetDriftDetectionNamespaceInMgmtCluster(sveltosNamespace),
+					Name:      randomString(),
+				},
+			}
+			createDriftDetectionManager(controllers.GetDriftDetectionManagerLabels(cluster.Namespace, cluster.Name,
+				libsveltosv1beta1.ClusterTypeCapi), ddm.Name)
+
+			// No cluster.
+			initObjects := []client.Object{
+				clusterProfile,
+				clusterSummary,
+			}
+
+			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+			logger := textlogger.NewLogger(textlogger.NewConfig())
+			dep := fakedeployer.GetClient(context.TODO(), logger, c)
+			clusterSummaryReconciler := getClusterSummaryReconciler(c, dep)
+			clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+			for range 2 {
+				result, err := controllers.ReconcileDelete(clusterSummaryReconciler, context.TODO(), clusterSummaryScope, logger)
+				Expect(err).To(BeNil())
+				Expect(result.RequeueAfter).ToNot(BeZero())
+			}
+
+			Expect(controllerutil.ContainsFinalizer(clusterSummaryScope.ClusterSummary,
+				configv1beta1.ClusterSummaryFinalizer)).To(BeTrue())
+			current := &libsveltosv1beta1.ResourceSummary{}
+			Expect(testEnv.GetAPIReader().Get(context.TODO(), client.ObjectKeyFromObject(rs), current)).To(Succeed())
+			Expect(current.Finalizers).To(ConsistOf(libsveltosv1beta1.ResourceSummaryFinalizer))
+
+			removeResourceSummaryFinalizer(rs)
+			Expect(testEnv.Delete(context.TODO(), ddm)).To(Succeed())
+		})
 
 	It("reconcileDelete removes the health monitoring resources, even when the cluster is not found", func() {
 		clusterSummary.Spec.ClusterProfileSpec.HealthMonitoring = &configv1beta1.HealthMonitoring{Enabled: true}

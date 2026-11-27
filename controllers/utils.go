@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/restmapper"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/yaml"
 
 	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
@@ -431,7 +432,7 @@ func removeStaleDriftDetectionResources(ctx context.Context, logger logr.Logger)
 					// Remove deployment only after this one succeed
 					// Do not change the order. First delete ResourceSummary instances. Till ResourceSummary
 					// instances are found, do not delete the drift-detection-manager deployment
-					err = removeStaleResourceSummary(ctx, clusterNs, clusterName, clusterType, logger)
+					err = removeStaleResourceSummary(ctx, clusterNs, clusterName, clusterType, false, logger)
 					if err != nil {
 						continue
 					}
@@ -457,8 +458,10 @@ func removeStaleDriftDetectionResources(ctx context.Context, logger logr.Logger)
 	}
 }
 
+// removeStaleResourceSummary deletes the cluster's ResourceSummaries. releaseFinalizer removes their
+// drift-detection-manager finalizer first, for when no drift-detection-manager is left to do it.
 func removeStaleResourceSummary(ctx context.Context, clusterNamespace, clusterName string,
-	clusterType libsveltosv1beta1.ClusterType, logger logr.Logger) error {
+	clusterType libsveltosv1beta1.ClusterType, releaseFinalizer bool, logger logr.Logger) error {
 
 	c := getManagementClusterClient()
 
@@ -501,7 +504,14 @@ func removeStaleResourceSummary(ctx context.Context, clusterNamespace, clusterNa
 			continue
 		}
 
-		err = c.Delete(ctx, rs)
+		if releaseFinalizer {
+			if err := releaseResourceSummaryFinalizer(ctx, c, rs, logger); err != nil {
+				return err
+			}
+		}
+
+		// Releasing the finalizer of a ResourceSummary already being deleted removes it.
+		err = client.IgnoreNotFound(c.Delete(ctx, rs))
 		if err != nil {
 			logger.V(logs.LogInfo).Info(
 				fmt.Sprintf("failed to delete resourceSummary instance: %v", err))
@@ -520,6 +530,24 @@ func removeStaleResourceSummary(ctx context.Context, clusterNamespace, clusterNa
 	}
 
 	return nil
+}
+
+func releaseResourceSummaryFinalizer(ctx context.Context, c client.Client, rs *libsveltosv1beta1.ResourceSummary,
+	logger logr.Logger) error {
+
+	patch := client.MergeFrom(rs.DeepCopy())
+	if !controllerutil.RemoveFinalizer(rs, libsveltosv1beta1.ResourceSummaryFinalizer) {
+		return nil
+	}
+
+	logger.V(logs.LogInfo).Info(fmt.Sprintf(
+		"no drift-detection-manager left, releasing finalizer of resourceSummary %s/%s", rs.Namespace, rs.Name))
+	// The cached copy can be stale: a ResourceSummary already gone needs nothing more.
+	err := client.IgnoreNotFound(c.Patch(ctx, rs, patch))
+	if err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to release resourceSummary finalizer: %v", err))
+	}
+	return err
 }
 
 func deplAssociatedClusterExist(ctx context.Context, c client.Client, depl *appsv1.Deployment,

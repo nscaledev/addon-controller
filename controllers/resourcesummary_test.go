@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -181,6 +182,76 @@ var _ = Describe("ResourceSummary Deployer", func() {
 				&corev1.ConfigMap{})
 			return apierrors.IsNotFound(err)
 		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("deployDriftDetectionManagerInManagementCluster keeps the oldest drift-detection-manager when duplicates exist",
+		func() {
+			clusterNamespace, clusterName := randomString(), randomString()
+			clusterType := libsveltosv1beta1.ClusterTypeSveltos
+			lbls := controllers.GetDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType)
+
+			oldest := "z-" + randomString()
+			createDriftDetectionManager(lbls, oldest)
+			// creationTimestamp has second resolution
+			time.Sleep(time.Second)
+			createDriftDetectionManager(lbls, "a-"+randomString())
+
+			Expect(controllers.DeployDriftDetectionManagerInManagementCluster(context.TODO(), testEnv.Config,
+				clusterNamespace, clusterName, "", clusterType, nil, nil, logger)).To(Succeed())
+			Expect(listDriftDetectionManagers(lbls)).To(ConsistOf(oldest))
+		})
+
+	It("deployDriftDetectionManagerInManagementCluster breaks a creation time tie between duplicates by name", func() {
+		clusterNamespace, clusterName := randomString(), randomString()
+		clusterType := libsveltosv1beta1.ClusterTypeSveltos
+		lbls := controllers.GetDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType)
+
+		first := "a-" + randomString()
+		createDriftDetectionManager(lbls, first)
+		createDriftDetectionManager(lbls, "z-"+randomString())
+
+		Expect(controllers.DeployDriftDetectionManagerInManagementCluster(context.TODO(), testEnv.Config,
+			clusterNamespace, clusterName, "", clusterType, nil, nil, logger)).To(Succeed())
+		Expect(listDriftDetectionManagers(lbls)).To(ConsistOf(first))
+	})
+
+	It("deployDriftDetectionManagerInManagementCluster does not keep a drift-detection-manager being deleted", func() {
+		clusterNamespace, clusterName := randomString(), randomString()
+		clusterType := libsveltosv1beta1.ClusterTypeSveltos
+		lbls := controllers.GetDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType)
+		const finalizer = "test.projectsveltos.io/finalizer"
+
+		deleting := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: controllers.GetDriftDetectionNamespaceInMgmtCluster(sveltosNamespace),
+				Name:      "a-" + randomString(),
+			},
+		}
+		createDriftDetectionManager(lbls, deleting.Name, finalizer)
+		Expect(testEnv.Delete(context.TODO(), deleting)).To(Succeed())
+		other := "z-" + randomString()
+		createDriftDetectionManager(lbls, other)
+
+		Expect(controllers.DeployDriftDetectionManagerInManagementCluster(context.TODO(), testEnv.Config,
+			clusterNamespace, clusterName, "", clusterType, nil, nil, logger)).To(Succeed())
+		Expect(listDriftDetectionManagers(lbls)).To(ConsistOf(other))
+
+		Expect(testEnv.GetAPIReader().Get(context.TODO(), client.ObjectKeyFromObject(deleting), deleting)).To(Succeed())
+		deleting.Finalizers = nil
+		Expect(testEnv.Update(context.TODO(), deleting)).To(Succeed())
+	})
+
+	It("removeDriftDetectionManagerFromManagementCluster removes every duplicate drift-detection-manager", func() {
+		clusterNamespace, clusterName := randomString(), randomString()
+		clusterType := libsveltosv1beta1.ClusterTypeSveltos
+		lbls := controllers.GetDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType)
+
+		createDriftDetectionManager(lbls, randomString())
+		createDriftDetectionManager(lbls, randomString())
+
+		Expect(controllers.RemoveDriftDetectionManagerFromManagementCluster(context.TODO(), clusterNamespace, clusterName,
+			clusterType, logger)).To(Succeed())
+		Expect(listDriftDetectionManagers(lbls)).To(BeEmpty())
 	})
 
 	It("deployDriftDetectionManagerInManagementCluster passes --watch-namespaces through when configured", func() {
@@ -472,6 +543,46 @@ spec:
         command:
         - /manager`
 
+var _ = Describe("isDriftDetectionManagerGone", func() {
+	var clusterNamespace, clusterName string
+	const clusterType = libsveltosv1beta1.ClusterTypeSveltos
+
+	BeforeEach(func() {
+		clusterNamespace, clusterName = randomString(), randomString()
+		controllers.SetAgentInMgmtCluster(true)
+		controllers.SetAgentClustersPerInstance(1)
+	})
+
+	AfterEach(func() {
+		controllers.SetAgentClustersPerInstance(0)
+		controllers.SetAgentInMgmtCluster(false)
+	})
+
+	isGone := func() bool {
+		gone, err := controllers.IsDriftDetectionManagerGone(context.TODO(), clusterNamespace, clusterName, clusterType)
+		Expect(err).To(BeNil())
+		return gone
+	}
+
+	It("returns true only while the cluster has no drift-detection-manager", func() {
+		Expect(isGone()).To(BeTrue())
+
+		createDriftDetectionManager(controllers.GetDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType),
+			randomString())
+		Expect(isGone()).To(BeFalse())
+	})
+
+	It("returns false when drift-detection-manager runs in the managed cluster", func() {
+		controllers.SetAgentInMgmtCluster(false)
+		Expect(isGone()).To(BeFalse())
+	})
+
+	It("returns false when a drift-detection-manager serves several clusters", func() {
+		controllers.SetAgentClustersPerInstance(2)
+		Expect(isGone()).To(BeFalse())
+	})
+})
+
 var _ = Describe("prepareDriftDetectionManagerYAML", func() {
 	It("leaves the watch-namespaces flag empty when watchNamespaces is nil", func() {
 		clusterType := libsveltosv1beta1.ClusterTypeCapi
@@ -646,4 +757,44 @@ func verifyLabels(currentLabels, expectedLabels map[string]string) bool {
 	}
 
 	return true
+}
+
+// createDriftDetectionManager creates a drift-detection-manager Deployment with the labels lbls, and
+// the selector of the real manifest so that deploying the manifest onto it succeeds.
+func createDriftDetectionManager(lbls map[string]string, name string, finalizers ...string) {
+	selector := map[string]string{"control-plane": name}
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  controllers.GetDriftDetectionNamespaceInMgmtCluster(sveltosNamespace),
+			Name:       name,
+			Labels:     lbls,
+			Finalizers: finalizers,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: selector},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "manager", Image: testDriftDetectionManagerName}}},
+			},
+		},
+	}
+	Expect(testEnv.Create(context.TODO(), deployment)).To(Succeed())
+}
+
+// listDriftDetectionManagers returns the names of the drift-detection-manager Deployments with the labels
+// lbls that are not being deleted, read from the API server rather than the cache.
+func listDriftDetectionManagers(lbls map[string]string) []string {
+	deployments := &appsv1.DeploymentList{}
+	Expect(testEnv.GetAPIReader().List(context.TODO(), deployments,
+		client.InNamespace(controllers.GetDriftDetectionNamespaceInMgmtCluster(sveltosNamespace)),
+		client.MatchingLabels(lbls),
+	)).To(Succeed())
+
+	var names []string
+	for i := range deployments.Items {
+		if deployments.Items[i].DeletionTimestamp == nil {
+			names = append(names, deployments.Items[i].Name)
+		}
+	}
+	return names
 }
