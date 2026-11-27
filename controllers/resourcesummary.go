@@ -607,6 +607,28 @@ func listDriftDetectionManagerDeployments(ctx context.Context, restConfig *rest.
 	return deployments.Items, nil
 }
 
+// isDriftDetectionManagerGone returns true when the cluster has no drift-detection-manager Deployment
+// in the management cluster, so nothing is left to remove the finalizer of its ResourceSummaries.
+// Only agentless mode without grouping is considered: in push mode the ResourceSummaries in the
+// management cluster belong to the management cluster's own drift-detection-manager, and a group
+// drift-detection-manager is not found by the cluster's labels.
+func isDriftDetectionManagerGone(ctx context.Context, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType) (bool, error) {
+
+	if !getAgentInMgmtCluster() || isDriftDetectionGroupingEnabled() {
+		return false, nil
+	}
+
+	// A Deployment being deleted counts: its pod can still be releasing finalizers.
+	deployments, err := listDriftDetectionManagerDeployments(ctx, getManagementClusterConfig(),
+		getDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType))
+	if err != nil {
+		return false, err
+	}
+
+	return len(deployments) == 0, nil
+}
+
 // getDriftDetectionManagerDeploymentName returns the name of the drift-detection-manager Deployment
 // started in the management cluster for the cluster matching lbls, or a new random name if there is none.
 func getDriftDetectionManagerDeploymentName(ctx context.Context, restConfig *rest.Config,

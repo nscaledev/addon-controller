@@ -543,6 +543,46 @@ spec:
         command:
         - /manager`
 
+var _ = Describe("isDriftDetectionManagerGone", func() {
+	var clusterNamespace, clusterName string
+	const clusterType = libsveltosv1beta1.ClusterTypeSveltos
+
+	BeforeEach(func() {
+		clusterNamespace, clusterName = randomString(), randomString()
+		controllers.SetAgentInMgmtCluster(true)
+		controllers.SetAgentClustersPerInstance(1)
+	})
+
+	AfterEach(func() {
+		controllers.SetAgentClustersPerInstance(0)
+		controllers.SetAgentInMgmtCluster(false)
+	})
+
+	isGone := func() bool {
+		gone, err := controllers.IsDriftDetectionManagerGone(context.TODO(), clusterNamespace, clusterName, clusterType)
+		Expect(err).To(BeNil())
+		return gone
+	}
+
+	It("returns true only while the cluster has no drift-detection-manager", func() {
+		Expect(isGone()).To(BeTrue())
+
+		createDriftDetectionManager(controllers.GetDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType),
+			randomString())
+		Expect(isGone()).To(BeFalse())
+	})
+
+	It("returns false when drift-detection-manager runs in the managed cluster", func() {
+		controllers.SetAgentInMgmtCluster(false)
+		Expect(isGone()).To(BeFalse())
+	})
+
+	It("returns false when a drift-detection-manager serves several clusters", func() {
+		controllers.SetAgentClustersPerInstance(2)
+		Expect(isGone()).To(BeFalse())
+	})
+})
+
 var _ = Describe("prepareDriftDetectionManagerYAML", func() {
 	It("leaves the watch-namespaces flag empty when watchNamespaces is nil", func() {
 		clusterType := libsveltosv1beta1.ClusterTypeCapi
